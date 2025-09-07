@@ -1,0 +1,260 @@
+---
+title: "Análisis de Modelos Lineales para Precios de Apartamentos en R"
+author: "TGrupo 2"
+date: "2023-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load_packages_data, message=FALSE, warning=FALSE}
+# Instalar y cargar paquetes necesarios si no están ya instalados
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("estimatr", quietly = TRUE)) install.packages("estimatr") # Para lm_robust (similar a statsmodels summary)
+
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(estimatr) # Esto nos dará un summary más parecido al de Python con statsmodels, si lo usaste.
+
+# --- Cargar datos ---
+# Asegúrate de reemplazar esta ruta con la ruta correcta a tu archivo apartments.csv
+# Por ejemplo: setwd("C:/Users/ASUS/OneDrive - Universidad del Pacífico/High_Dimensional_Linear_Models/R/scripts")
+# Y luego: df <- read_csv("../input/apartments.csv")
+# La siguiente línea asume que el archivo está en una ruta absoluta, ajusta según tu estructura de carpetas.
+df <- read_csv("C:/Users/ASUS/OneDrive - Universidad del Pacífico/High_Dimensional_Linear_Models/Python/input/apartments.csv")
+```
+
+```{r data_cleaning_3a}
+# 1. Crear una variable area2 que sea el cuadrado de area
+df <- df %>%
+  mutate(area2 = area^2)
+
+# 2. Convertir 'hasparkingspace', 'hasbalcony', 'haselevator', 'hassecurity', 'hasstorageroom' a variables dummy
+dummy_cols <- c('hasparkingspace', 'hasbalcony', 'haselevator', 'hassecurity', 'hasstorageroom')
+for (col in dummy_cols) {
+  df[[col]] <- as.integer(df[[col]] == 'yes')
+}
+
+# 3. Para cada último dígito de area (i.e. 0,1,...,9), crear una variable dummy
+for (i in 0:9) {
+  df[[paste0('end_', i)]] <- as.integer(floor(df$area) %% 10 == i)
+}
+
+cat("--- Parte 3a: Limpieza de datos completada ---\n")
+print(head(df))
+```
+
+```{r linear_model_estimation_3b}
+
+# Lista de todas las covariables base, incluyendo las distancias y las 'has' dummies
+# Es crucial que estos nombres coincidan con los nombres reales de las columnas en tu CSV.
+# He estandarizado a camelCase como en tu Python, pero verifica tu CSV.
+covariates_base <- c(
+  'area', 'area2', # area2 ya está creada en 3a
+  'schooldistance', 'clinicdistance', 'postofficedistance',
+  'kindergartendistance', 'restaurantdistance', 'collegedistance', 'pharmacydistance',
+  'hasParkingSpace', 'hasBalcony', 'hasElevator', 'hasSecurity', 'hasStorageRoom' # Nombres actualizados
+)
+
+# A menudo, en CSVs, 'hasparkingspace' puede ser 'hasParkingSpace'.
+# Vamos a usar los nombres exactos que has usado en tu Python, que son típicamente
+
+# Vamos a crear una lista de "distancia" y "has_dummy" para facilitar la verificación
+distance_cols <- c('schooldistance', 'clinicdistance', 'postofficedistance',
+                   'kindergartendistance', 'restaurantdistance', 'collegedistance', 'pharmacydistance')
+has_dummies_cols <- c('hasparkingspace', 'hasbalcony', 'haselevator', 'hassecurity', 'hasstorageroom')
+
+# `covariates_b` ahora contendrá solo las columnas que realmente existen y son relevantes.
+covariates_b <- actual_covariates
+
+# Asegurarse de que 'end_9' no esté en la lista, si es que se incluyó de alguna manera
+covariates_b <- setdiff(covariates_b, 'end_9')
+
+# Filtrar el DataFrame para asegurar que no haya NaNs en las variables relevantes antes de la regresión
+df_clean_b <- df %>%
+  select(price, all_of(covariates_b)) %>%
+  na.omit()
+
+# Formular el modelo lineal
+formula_b <- as.formula(paste("price ~ ", paste(covariates_b, collapse = " + ")))
+
+# Estimar el modelo OLS completo
+model_ols_b <- lm_robust(formula_b, data = df_clean_b) # Usamos lm_robust para un summary más completo
+cat("\n--- Parte 3b: Resumen del modelo OLS completo ---\n")
+print(summary(model_ols_b))
+
+# Coeficiente de end_0
+# Verificamos si 'end_0' está en los coeficientes del modelo
+if ("end_0" %in% names(coef(model_ols_b))) {
+  end_0_coef_b <- coef(model_ols_b)["end_0"]
+} else {
+  end_0_coef_b <- 0 # Si 'end_0' no está en el modelo (raro si la lista de covars es correcta)
+  warning("El coeficiente 'end_0' no se encontró en el modelo OLS completo.")
+}
+
+r_squared_b <- summary(model_ols_b)$r.squared # R-cuadrado para lm_robust
+
+cat(sprintf("\nR-cuadrado: %.4f\n", r_squared_b))
+cat(sprintf("Comentario sobre end_0: El coeficiente es %.2f.\n", end_0_coef_b))
+if (end_0_coef_b > 0) {
+  cat(sprintf("Esto sugiere que los apartamentos con área terminando en 0 tienen un precio mayor en %.2f unidades monetarias comparado con aquellos que terminan en 9 (base), ceteris paribus.\n", abs(end_0_coef_b)))
+} else {
+  cat(sprintf("Esto sugiere que los apartamentos con área terminando en 0 tienen un precio menor en %.2f unidades monetarias comparado con aquellos que terminan en 9 (base), ceteris paribus.\n", abs(end_0_coef_b)))
+}
+
+
+# --- Parte 3b: Realizar la misma regresión mediante partialling-out ---
+# Objetivo: verificar el coeficiente de end_0
+
+# Variables sin end_0
+covariates_without_end_0 <- setdiff(covariates_b, 'end_0')
+formula_without_end_0 <- as.formula(paste(" ~ ", paste(covariates_without_end_0, collapse = " + ")))
+
+# 1. Regresar y (price) sobre X sin 'end_0' y obtener los residuos (e_y)
+model_y_po <- lm(update(formula_without_end_0, price ~ .), data = df_clean_b)
+e_y <- residuals(model_y_po)
+
+# 2. Regresar end_0 sobre X sin 'end_0' y obtener los residuos (e_d)
+# Asegurarse de que 'end_0' exista en df_clean_b para esta regresión
+if ('end_0' %in% colnames(df_clean_b)) {
+  model_d_po <- lm(update(formula_without_end_0, end_0 ~ .), data = df_clean_b)
+  e_d <- residuals(model_d_po)
+} else {
+  stop("La columna 'end_0' no se encontró en df_clean_b, no se puede realizar partialling-out.")
+}
+
+
+# 3. Regresar e_y sobre e_d
+model_po <- lm_robust(e_y ~ e_d)
+cat("\n--- Parte 3b: Resumen del modelo partialled-out ---\n")
+print(summary(model_po))
+
+# Verificamos si 'e_d' está en los coeficientes del modelo partialled-out
+if ("e_d" %in% names(coef(model_po))) {
+  end_0_coef_po <- coef(model_po)["e_d"]
+} else {
+  end_0_coef_po <- NA # No se pudo obtener el coeficiente
+  warning("El coeficiente 'e_d' no se encontró en el modelo partialled-out.")
+}
+
+
+cat(sprintf("\nCoeficiente de end_0 en modelo completo: %.4f\n", end_0_coef_b))
+cat(sprintf("Coeficiente de end_0 en partialling-out: %.4f\n", end_0_coef_po))
+
+# Verificar que los coeficientes son los mismos (solo si ambos existen)
+if (!is.na(end_0_coef_b) && !is.na(end_0_coef_po) && abs(end_0_coef_b - end_0_coef_po) < 1e-6) {
+  cat("¡Los coeficientes de 'end_0' son prácticamente idénticos en ambos métodos!\n")
+} else if (is.na(end_0_coef_b) || is.na(end_0_coef_po)) {
+  cat("No se pudieron comparar los coeficientes de 'end_0' debido a valores NA.\n")
+} else {
+  cat("Advertencia: Los coeficientes de 'end_0' difieren entre los dos métodos.\n")
+}
+```
+
+```{r price_premium_3c}
+# 1. Entrenar el modelo SÓLO usando apartamentos cuya área NO termina en 0.
+# Ajustar la fórmula para no incluir 'end_0' en el modelo de entrenamiento
+covariates_c_train <- setdiff(covariates_b, 'end_0')
+formula_c_train <- as.formula(paste("price ~ ", paste(covariates_c_train, collapse = " + ")))
+
+# Seleccionar solo las columnas necesarias para este subconjunto ANTES de filtrar y omitir NA
+df_no_end_0_c_prep <- df %>%
+  filter(end_0 == 0) %>%
+  select(price, all_of(covariates_c_train))
+
+df_no_end_0_c <- df_no_end_0_c_prep %>%
+  na.omit() # Quitar NaNs específicos de este subconjunto
+
+model_no_end_0_c <- lm_robust(formula_c_train, data = df_no_end_0_c)
+
+cat("\n--- Parte 3c: Precio premium para áreas que terminan en 0 ---\n")
+cat("\nModelo entrenado SÓLO con apartamentos cuya área NO termina en 0.\n")
+print(summary(model_no_end_0_c))
+
+
+# 2. Predecir precios para toda la muestra.
+# Asegurarse de que el DataFrame para la predicción tiene las mismas columnas
+# y en el mismo orden que el DataFrame de entrenamiento (df_no_end_0_c).
+# Usamos el dataframe original completo 'df', pero solo con las variables de 'covariates_c_train'
+df_full_predict_c_prep <- df %>%
+  select(price, all_of(covariates_c_train))
+
+# Solo para las filas que no tienen NA en las variables de predicción
+df_full_predict_c <- df_full_predict_c_prep %>%
+  na.omit()
+
+# Guardar los índices de las filas que se usarán para la predicción
+original_indices_for_prediction <- row.names(df_full_predict_c)
+
+# Realizar las predicciones
+df_full_predict_c$predicted_price <- predict(model_no_end_0_c, newdata = df_full_predict_c)
+
+# Crear una columna 'predicted_price' en el dataframe original 'df' y llenarla con NaNs
+df$predicted_price <- NA_real_ # Usar NA_real_ para valores numéricos
+# Asignar las predicciones a las filas correctas en el dataframe original
+df[original_indices_for_prediction, "predicted_price"] <- df_full_predict_c$predicted_price
+
+cat("\nPrecios predichos para toda la muestra (incluyendo apartamentos con área terminada en 0).\n")
+print(head(df %>% select(price, predicted_price, end_0)))
+
+
+# 3. Comparar promedios para apartamentos cuya área termina en 0.
+apartments_end_0_c <- df %>%
+  filter(end_0 == 1) %>%
+  na.omit() # Asegurarse de que solo tomamos los que tienen predicciones válidas
+
+average_actual_price_end_0_c <- mean(apartments_end_0_c$price)
+average_predicted_price_end_0_c <- mean(apartments_end_0_c$predicted_price)
+
+cat(sprintf("\nPara apartamentos cuya área termina en 0:\n"))
+cat(sprintf("  Precio real promedio: %.2f PLN\n", average_actual_price_end_0_c))
+cat(sprintf("  Precio predicho promedio: %.2f PLN\n", average_predicted_price_end_0_c))
+
+if (average_actual_price_end_0_c > average_predicted_price_end_0_c) {
+  cat(sprintf("\nConclusión (basada en promedios): Los apartamentos con áreas que terminan en 0\n"))
+  cat(sprintf("parecen venderse a un precio MAYOR de lo que el modelo predice,\n"))
+  cat(sprintf("sugiriendo un premium de aproximadamente %.2f PLN.\n", average_actual_price_end_0_c - average_predicted_price_end_0_c))
+} else if (average_actual_price_end_0_c < average_predicted_price_end_0_c) {
+  cat(sprintf("\nConclusión (basada en promedios): Los apartamentos con áreas que terminan en 0\n"))
+  cat(sprintf("parecen venderse a un precio MENOR de lo que el modelo predice,\n"))
+  cat(sprintf("sugiriendo un descuento de aproximadamente %.2f PLN.\n", average_predicted_price_end_0_c - average_actual_price_end_0_c))
+} else {
+  cat(sprintf("\nConclusión (basada en promedios): Los apartamentos con áreas que terminan en 0\n"))
+  cat(sprintf("parecen venderse a un precio similar a lo que el modelo predice.\n"))
+}
+
+```
+
+
+
+```{r plot_actual_vs_predicted_3c, fig.width=10, fig.height=6}
+# Preparamos los datos para el gráfico, enfocándonos en los apartamentos con 'end_0 == 1'
+# Asegurarnos de usar el dataframe 'df' que ahora tiene 'predicted_price'
+apartments_end_0_plot <- df %>%
+  filter(end_0 == 1) %>%
+  select(price, predicted_price) %>%
+  na.omit() %>% # Solo filas con predicciones válidas
+  arrange(price) %>% # Ordenar por precio real para una mejor visualización de la tendencia
+  mutate(index_plot = row_number()) # Añadir un índice para el eje X
+
+# Creamos el gráfico de líneas
+ggplot(apartments_end_0_plot, aes(x = index_plot)) +
+  geom_line(aes(y = price, color = "Precio Real"), alpha = 0.7) +
+  geom_line(aes(y = predicted_price, color = "Precio Predicho (Modelo sin end_0)"), alpha = 0.7) +
+  labs(
+    title = "Comparación de Precio Real vs. Precio Predicho para Apartamentos con Área Terminada en 0",
+    x = "Índice de Apartamento (ordenado por Precio Real)",
+    y = "Precio (PLN)",
+    color = "Tipo de Precio"
+  ) +
+  scale_color_manual(values = c("Precio Real" = "blue", "Precio Predicho (Modelo sin end_0)" = "red")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) # Centrar el título
+
+```
